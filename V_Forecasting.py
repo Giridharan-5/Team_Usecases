@@ -1,0 +1,301 @@
+from collections import defaultdict
+from datetime import datetime
+from typing import Any, Dict, List
+import numpy as np
+from src.agent_orch.agents.base_agent import BaseAgent
+import pandas as pd
+from src.agent_orch.agents.models.models import (
+    ARIMA_model, SARIMA_model, Holt_Winters_model, Prophet_Model,
+    XGBoost_Model, LSTM_Model, LR_Model, RFR_model,
+    KNN_Model, EN_Model, SVR_Model, insert_db
+)
+from src.agent_orch.utils.DBConnect import DBConnect
+
+
+class ForecastingAgent(BaseAgent):
+    def __init__(self, name="forecasting", forecast_length=45):
+        super().__init__(name)
+        self.forecast_length = 45
+        self.db = DBConnect()
+
+    async  def run(self, state: dict) -> dict:
+        server_id = state.get("server_id")
+        ptype = state.get("resource_type")
+
+        # === Step 1: Fetch historical usage data from DB
+        query = f"""
+            SELECT vpu.vpu_id as vm_id, vud.dou, vud.avg_usage
+            FROM vm_primary_uri vpu
+            INNER JOIN vm_usage_details vud
+                ON vpu.vpu_id = vud.vpu_id
+            WHERE vpu.vm_id = '{server_id}'
+              AND vpu.resource_type = '{ptype}';
+        """
+        rows = self.db.select(raw_query=query)
+        data = pd.DataFrame(rows)
+
+        if data.empty:
+            message = (
+                f"No usage history available for server '{server_id}' "
+                f"and resource '{ptype}'. Skipping forecasting run."
+            )
+            self.logger.warning(message)
+            warnings = state.get("warnings")
+            if isinstance(warnings, list):
+                warnings.append(message)
+            elif warnings:
+                state["warnings"] = [warnings, message]
+            else:
+                state["warnings"] = [message]
+            self.attach_result(state, "all_forecasts", {})
+            self.attach_result(state, "forecasts", {})
+            self.attach_result(state, "errors", {})
+            self.attach_result(state, "run_id", None)
+            self.attach_result(state, "plots", {"phase1": [], "phase2": []})
+            self.attach_result(state, "plot_phase1", [])
+            self.attach_result(state, "plot_phase2", [])
+            state["forecast_status"] = "no_data"
+            return state
+
+        #renaming for future use
+        data = data.rename(columns={ 
+            'dou': 'date',
+            'vm_id': 'server_id',
+            'avg_usage': 'avg_cpu_usage'
+        })
+        data['date'] = pd.to_datetime(data['date']) #converting to datetime
+        data = data.sort_values(by=['server_id', 'date']) #sorting for time series algos
+
+        plots_phase1: List[Dict[str, Any]] = []
+        plots_phase2: List[Dict[str, Any]] = []
+        accuracy_lookup: Dict[str, Dict[str, float]] = defaultdict(dict)
+        color_palette = [
+            "#38bdf8",
+            "#f97316",
+            "#22d3ee",
+            "#a855f7",
+            "#facc15",
+            "#2dd4bf",
+            "#f472b6",
+        ]
+
+        models = [
+            'ARIMA', 'SARIMA', 'Holt-Winters', 'Prophet',
+            'XGBoost', 'LSTM', 'Linear Regression',
+            'Random Forest', 'KNN', 'Elastic Net', 'SVR'
+        ]
+
+        forecasts = {model: [] for model in models}
+        errors = {model: [] for model in models}
+        top_models_per_server = pd.DataFrame(columns=['server_id', 'model', 'mse'])
+        first_server_id = data.iloc[0]['server_id']
+        print(first_server_id)
+        # === Step 2: Insert a new forecast_runs entry (start of run)
+        start_time = datetime.now()
+        run_data = {            
+            "start_time": start_time,
+            "vpu_id": int(first_server_id),
+            "resource_type": ptype,
+            "inserted_by": "ForecastingAgent",
+            "inserted_date": start_time,
+            "updated_by": "ForecastingAgent",
+            "updated_date": start_time
+        }
+        print(run_data);
+        run_id =self.db.insert_autonum("forecast_runs", run_data)
+        #run_id = self.db.cursor.execute("SELECT LAST_INSERT_ID()").fetchval()
+
+        # === Step 3: Train & evaluate all models
+        for server_id in data['server_id'].unique():
+            server_data = data[data['server_id'] == server_id]
+            train_size = int(len(server_data) * 0.8)
+            days_predict = int(len(server_data) - train_size)
+            train = server_data[:-days_predict-1]
+            test = server_data[-days_predict:]
+            # run all models
+            ARIMA_model(train, test, days_predict, forecasts, errors, server_id, ptype, 'vm_predict_test')
+            SARIMA_model(train, test, days_predict, forecasts, errors, server_id, ptype, 'vm_predict_test')
+            Holt_Winters_model(train, test, days_predict, forecasts, errors, server_id, ptype, 'vm_predict_test')
+            Prophet_Model(train, test, days_predict, forecasts, errors, server_id, ptype, 'vm_predict_test')
+            XGBoost_Model(train, test, days_predict, forecasts, errors, server_id, ptype, 'vm_predict_test')
+            LSTM_Model(train, test, days_predict, forecasts, errors, server_id, ptype, 'vm_predict_test')
+            LR_Model(train, test, days_predict, forecasts, errors, server_id, ptype, 'vm_predict_test')
+            RFR_model(train, test, days_predict, forecasts, errors, server_id, ptype, 'vm_predict_test')
+            KNN_Model(train, test, days_predict, forecasts, errors, server_id, ptype, 'vm_predict_test')
+            EN_Model(train, test, days_predict, forecasts, errors, server_id, ptype, 'vm_predict_test')
+            SVR_Model(train, test, days_predict, forecasts, errors, server_id, ptype, 'vm_predict_test')
+
+            # pick top 3 models by error
+            server_errors = []
+            for model in models:
+                if server_id in [df['server_id'].iloc[0] for df in forecasts[model]]:
+                    idx = [df['server_id'].iloc[0] for df in forecasts[model]].index(server_id)
+                    server_errors.append((model, errors[model][idx]))
+            server_errors = sorted(server_errors, key=lambda x: x[1])[:3]
+
+        for model, mse in server_errors:
+            top_models_per_server = pd.concat([
+                top_models_per_server,
+                pd.DataFrame({'server_id': [server_id], 'model': [model], 'mse': [mse]})
+            ], ignore_index=True)
+
+        evaluation_frames: Dict[str, pd.DataFrame] = {}
+        for model in models:
+            model_runs = forecasts.get(model, [])
+            if model_runs:
+                combined = pd.concat(model_runs, ignore_index=True)
+                if "ds" in combined.columns:
+                    combined["ds"] = pd.to_datetime(combined["ds"], errors="coerce")
+                evaluation_frames[model] = combined
+            else:
+                evaluation_frames[model] = pd.DataFrame()
+
+        for server_id in data['server_id'].unique():
+            server_usage = (
+                data[data['server_id'] == server_id]
+                .sort_values('date')
+            )
+            if not server_usage.empty:
+                plots_phase1.append(
+                    {
+                        "name": f"Actual Usage ({server_id})",
+                        "x": server_usage["date"].dt.strftime("%Y-%m-%d").tolist(),
+                        "y": server_usage["avg_cpu_usage"].round(2).tolist(),
+                        "mode": "lines",
+                        "line": {"width": 2, "color": "#38bdf8"},
+                    }
+                )
+            top_models = top_models_per_server[top_models_per_server['server_id'] == server_id]
+            for idx, row in top_models.iterrows():
+                model_name = row["model"]
+                mse_value = row.get("mse")
+                accuracy = None
+                try:
+                    if mse_value is not None:
+                        accuracy = max(0.0, 100.0 - float(np.sqrt(float(mse_value))))
+                        accuracy_lookup[server_id][model_name] = accuracy
+                except (TypeError, ValueError):
+                    accuracy = None
+                display_name = (
+                    f"{model_name} ({accuracy:.2f}% accuracy)" if accuracy is not None else model_name
+                )
+                model_df = evaluation_frames.get(model_name)
+                if model_df is None or model_df.empty:
+                    continue
+                server_model_df = (
+                    model_df[model_df["server_id"] == server_id]
+                    .sort_values("ds")
+                )
+                if server_model_df.empty:
+                    continue
+                plots_phase1.append(
+                    {
+                        "name": display_name,
+                        "x": server_model_df["ds"].dt.strftime("%Y-%m-%d").tolist(),
+                        "y": server_model_df["yhat"].round(2).tolist(),
+                        "mode": "lines",
+                        "line": {"width": 2, "color": color_palette[(idx + 1) % len(color_palette)]},
+                    }
+                )
+
+        # === Step 4: Forecast future with top-3 and insert results
+        final_forecasts = forecasts
+        forecasts = {model: [] for model in models}
+        for server_id in data['server_id'].unique():
+            server_data = data[data['server_id'] == server_id]
+            top_models = top_models_per_server[top_models_per_server['server_id'] == server_id].reset_index(drop=True)
+            if not server_data.empty:
+                plots_phase2.append(
+                    {
+                        "name": f"Historical Usage ({server_id})",
+                        "x": server_data["date"].dt.strftime("%Y-%m-%d").tolist(),
+                        "y": server_data["avg_cpu_usage"].round(2).tolist(),
+                        "mode": "lines",
+                        "line": {"width": 2, "color": "#38bdf8"},
+                    }
+                )
+            print(server_data['date'].max())
+            fd_test = pd.date_range(
+                start=server_data['date'].max(),
+                periods=self.forecast_length,
+                freq='D'
+            )
+            test = pd.DataFrame({
+                "date": fd_test,
+                "avg_cpu_usage": 0
+            })
+            print(test)
+
+            for idx, row in top_models.iterrows():
+                model_name = row['model']
+                # run forecast for each top-3 model
+                if model_name == 'ARIMA':
+                    ARIMA_model(server_data, test, self.forecast_length, forecasts, errors, server_id, ptype, 'vm_predict_future')
+                elif model_name == 'SARIMA':
+                    SARIMA_model(server_data, test, self.forecast_length, forecasts, errors, server_id, ptype, 'vm_predict_future')
+                elif model_name == 'Holt-Winters':
+                    Holt_Winters_model(server_data, test, self.forecast_length, forecasts, errors, server_id, ptype, 'vm_predict_future')
+                elif model_name == 'Prophet':
+                    Prophet_Model(server_data, test, self.forecast_length, forecasts, errors, server_id, ptype, 'vm_predict_future')
+                elif model_name == 'XGBoost':
+                    XGBoost_Model(server_data, test, self.forecast_length, forecasts, errors, server_id, ptype, 'vm_predict_future')
+                elif model_name == 'LSTM':
+                    LSTM_Model(server_data, test, self.forecast_length, forecasts, errors, server_id, ptype, 'vm_predict_future')
+                elif model_name == 'Linear Regression':
+                    LR_Model(server_data, test, self.forecast_length, forecasts, errors, server_id, ptype, 'vm_predict_future')
+                elif model_name == 'Random Forest':
+                    RFR_model(server_data, test, self.forecast_length, forecasts, errors, server_id, ptype, 'vm_predict_future')
+                elif model_name == 'KNN':
+                    KNN_Model(server_data, test, self.forecast_length, forecasts, errors, server_id, ptype, 'vm_predict_future')
+                elif model_name == 'Elastic Net':
+                    EN_Model(server_data, test, self.forecast_length, forecasts, errors, server_id, ptype, 'vm_predict_future')
+                elif model_name == 'SVR':
+                    SVR_Model(server_data, test, self.forecast_length, forecasts, errors, server_id, ptype, 'vm_predict_future')
+                
+                # take last forecast for this model
+                # forecast_df = forecasts[model_name][-1]
+                forecast_df = pd.concat(forecasts[model_name], ignore_index=True)
+                #print(forecasts)
+                if "ds" in forecast_df.columns:
+                    forecast_df["ds"] = pd.to_datetime(forecast_df["ds"], errors="coerce")
+                forecast_df = forecast_df[forecast_df["server_id"] == server_id]
+                # insert forecast results into DB
+                insert_db(forecast_df, run_id)
+                accuracy = accuracy_lookup.get(server_id, {}).get(model_name)
+                display_name = (
+                    f"{model_name} Forecast ({accuracy:.2f}% accuracy)"
+                    if accuracy is not None
+                    else f"{model_name} Forecast"
+                )
+                if not forecast_df.empty:
+                    plots_phase2.append(
+                        {
+                            "name": display_name,
+                            "x": forecast_df["ds"].dt.strftime("%Y-%m-%d").tolist(),
+                            "y": forecast_df["yhat"].round(2).tolist(),
+                            "mode": "lines",
+                            "line": {"width": 2, "color": color_palette[(idx + 2) % len(color_palette)]},
+                        }
+                    )
+
+            selected_models = top_models['model'].tolist()
+            final_forecasts[server_id] = {m: forecasts[m] for m in selected_models}
+
+        # === Step 5: Update run end_time
+        #end_time = datetime.now()
+        ##self.db.update(
+        #    "forecast_runs",
+        #    {"end_time": end_time, "updated_date": end_time},
+        #    f"run_id={run_id}"
+        #)
+
+        # === Step 6: Attach results to state
+        self.attach_result(state, "all_forecasts", forecasts)
+        self.attach_result(state, "forecasts", final_forecasts)
+        self.attach_result(state, "errors", errors)
+        self.attach_result(state, "run_id", run_id)
+        plots_payload = {"phase1": plots_phase1, "phase2": plots_phase2}
+        self.attach_result(state, "plots", plots_payload)
+        self.attach_result(state, "plot_phase1", plots_phase1)
+        self.attach_result(state, "plot_phase2", plots_phase2)
+        return state
