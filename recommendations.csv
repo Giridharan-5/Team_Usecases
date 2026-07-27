@@ -1,0 +1,2 @@
+r_id,Server Name,Resource Type,avg_usage,max_usage,forecasted_max,decision,scale_percent,itis_ticket_number,action_status,remarks
+,,,0.73,9.03,4.71,scale_down,50,,,
