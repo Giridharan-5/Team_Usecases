@@ -1,0 +1,96 @@
+-------------vm_details---
+CREATE TABLE `vm_details` (
+  `vm_id` int NOT NULL,
+  `vm_name` varchar(100) DEFAULT NULL,
+  `cpu_count` int DEFAULT NULL,
+  `cpu_core_count` int DEFAULT NULL,
+  `ram` int DEFAULT NULL,
+  `hypervisor` varchar(100) DEFAULT NULL,
+  `resize_type` varchar(50) DEFAULT 'no_change',
+  PRIMARY KEY (`vm_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-------------vm_primary_uri---
+
+CREATE TABLE `vm_primary_uri` (
+  `vpu_id` int NOT NULL,
+  `vm_id` int NOT NULL,
+  `resource_type` varchar(100) DEFAULT NULL,
+  `resource_name` varchar(255) DEFAULT NULL,
+  `uri` varchar(500) DEFAULT NULL,
+  `pstatus` varchar(50) DEFAULT NULL,
+  `inserted_by` varchar(100) DEFAULT NULL,
+  `inserted_date` datetime DEFAULT CURRENT_TIMESTAMP,
+  `updated_by` varchar(100) DEFAULT NULL,
+  `updated_date` datetime DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`vpu_id`),
+  KEY `vm_id` (`vm_id`),
+  CONSTRAINT `vm_primary_uri_ibfk_1` FOREIGN KEY (`vm_id`) REFERENCES `vm_details` (`vm_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-------------vm_usage_details----
+
+CREATE TABLE `vm_usage_details` (
+  `vpu_id` int NOT NULL,
+  `dou` date NOT NULL,
+  `min_usage` float DEFAULT NULL,
+  `max_usage` float NOT NULL,
+  `avg_usage` float NOT NULL,
+  `inserted_by` varchar(100) NOT NULL,
+  `inserted_date` datetime DEFAULT CURRENT_TIMESTAMP,
+  `updated_by` varchar(100) DEFAULT NULL,
+  `updated_date` datetime DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`vpu_id`,`dou`,`avg_usage`,`max_usage`),
+  CONSTRAINT `vm_usage_details_ibfk_1` FOREIGN KEY (`vpu_id`) REFERENCES `vm_primary_uri` (`vpu_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-------------recommendations-----
+
+CREATE TABLE `recommendations` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `vpu_id` int NOT NULL,
+  `decision` varchar(50) DEFAULT NULL,
+  `resource_type` varchar(100) DEFAULT NULL,
+  `avg_usage` float DEFAULT NULL,
+  `max_usage` float DEFAULT NULL,
+  `forecasted_max` float DEFAULT NULL,
+  `scale_percent` float DEFAULT NULL,
+  `itis_ticket_number` varchar(100) DEFAULT NULL,
+  `action_status` varchar(50) DEFAULT NULL,
+  `remarks` text,
+  `run_id` varchar(100) DEFAULT NULL,
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `fk_recommendations_vpu` (`vpu_id`),
+  CONSTRAINT `fk_recommendations_vpu` FOREIGN KEY (`vpu_id`) REFERENCES `vm_primary_uri` (`vpu_id`)
+) ENGINE=InnoDB AUTO_INCREMENT=1003 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-------------forcast_run-----
+
+CREATE TABLE `forecast_runs` (
+  `run_id` bigint NOT NULL AUTO_INCREMENT,
+  `start_time` datetime NOT NULL,
+  `vpu_id` bigint DEFAULT NULL,
+  `resource_type` varchar(50) NOT NULL,
+  `inserted_by` varchar(100) NOT NULL,
+  `inserted_date` datetime NOT NULL,
+  `updated_by` varchar(100) NOT NULL,
+  `updated_date` datetime NOT NULL,
+  PRIMARY KEY (`run_id`)
+) ENGINE=InnoDB AUTO_INCREMENT=63 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+
+-------------forecast_results----
+
+CREATE TABLE `forecast_results` (
+  `run_id` bigint NOT NULL,
+  `dop` date NOT NULL,
+  `alg` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `p_avg_usage` decimal(10,2) NOT NULL,
+  `inserted_by` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `inserted_date` datetime NOT NULL,
+  `updated_by` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `updated_date` datetime NOT NULL,
+  KEY `idx_run_dop` (`run_id`,`dop`),
+  CONSTRAINT `1` FOREIGN KEY (`run_id`) REFERENCES `forecast_runs` (`run_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
